@@ -380,7 +380,7 @@ class GPUModelRunner(
         self.conf_es_sample_range = _env_optional_int("VLLM_CONF_ES_RANGE")
         self.conf_es_temperature = _env_float("VLLM_CONF_ES_TEMPERATURE", 1.0)
         self.conf_es_step = 0
-        self.conf_es_step_stats: dict[str, dict[str, int]] = {}
+        self.conf_es_request_stats: dict[str, dict[str, int]] = {}
         if self.conf_es_enabled:
             logger.info(
                 "Enabled vLLM confidence-ES detection by environment fallback "
@@ -2777,7 +2777,7 @@ class GPUModelRunner(
         enabled_indices = enabled_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
         for req_index in enabled_indices:
             req_id = self.input_batch.req_ids[req_index]
-            stats = self.conf_es_step_stats.setdefault(req_id, {"low": 0, "total": 0})
+            stats = self.conf_es_request_stats.setdefault(req_id, {"low": 0, "total": 0})
             stats["total"] += 1
             if bool(low_confidence[req_index].item()):
                 stats["low"] += 1
@@ -3555,6 +3555,10 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
+            for req_id in list(self.conf_es_request_stats):
+                if req_id not in self.requests and req_id not in req_ids_output_copy:
+                    self.conf_es_request_stats.pop(req_id, None)
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -3567,9 +3571,12 @@ class GPUModelRunner(
                 if self.supports_mm_inputs
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
-                conf_es_stats=self.conf_es_step_stats or None,
+                conf_es_stats={
+                    req_id: dict(self.conf_es_request_stats[req_id])
+                    for req_id in req_ids_output_copy
+                    if req_id in self.conf_es_request_stats
+                } or None,
             )
-            self.conf_es_step_stats = {}
 
         if not self.use_async_scheduling:
             return output
