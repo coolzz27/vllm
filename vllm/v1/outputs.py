@@ -169,6 +169,9 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # req_id -> confidence-ES replay stats for this model step.
+    conf_es_stats: dict[str, dict[str, int]] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

@@ -1036,6 +1036,7 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
+        conf_es_stats = model_runner_output.conf_es_stats or {}
         kv_connector_output = model_runner_output.kv_connector_output
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
@@ -1145,9 +1146,15 @@ class Scheduler(SchedulerInterface):
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
+            request_conf_es_stats = conf_es_stats.get(req_id)
+            output_kv_transfer_params = kv_transfer_params
+            if request_conf_es_stats is not None:
+                output_kv_transfer_params = dict(kv_transfer_params or {})
+                output_kv_transfer_params["conf_es_stats"] = request_conf_es_stats
+
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params:
+            if new_token_ids or pooler_output is not None or output_kv_transfer_params:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -1159,7 +1166,7 @@ class Scheduler(SchedulerInterface):
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
-                        kv_transfer_params=kv_transfer_params,
+                        kv_transfer_params=output_kv_transfer_params,
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
                         num_nans_in_logits=request.num_nans_in_logits,

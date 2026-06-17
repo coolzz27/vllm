@@ -3,6 +3,7 @@
 
 import gc
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -177,6 +178,31 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return float(value)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return int(value)
+
+
+def _env_optional_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return None
+    return int(value)
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -344,6 +370,31 @@ class GPUModelRunner(
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+        self.conf_es_enabled = _env_flag("VLLM_CONF_ES")
+        self.conf_es_threshold = _env_float("VLLM_CONF_ES_THRESHOLD", 0.7)
+        self.conf_es_method = os.environ.get("VLLM_CONF_ES_METHOD", "max_prob")
+        self.conf_es_log_interval = max(1, _env_int("VLLM_CONF_ES_LOG_INTERVAL", 1))
+        self.conf_es_replay_enabled = _env_flag("VLLM_CONF_ES_REPLAY")
+        self.conf_es_branches = max(1, _env_int("VLLM_CONF_ES_BRANCHES", 4))
+        self.conf_es_keep = _env_optional_int("VLLM_CONF_ES_KEEP")
+        self.conf_es_sample_range = _env_optional_int("VLLM_CONF_ES_RANGE")
+        self.conf_es_temperature = _env_float("VLLM_CONF_ES_TEMPERATURE", 1.0)
+        self.conf_es_step = 0
+        self.conf_es_step_stats: dict[str, dict[str, int]] = {}
+        if self.conf_es_enabled:
+            logger.info(
+                "Enabled vLLM confidence-ES detection by environment fallback "
+                "(method=%s, threshold=%s, log_interval=%s, replay=%s, "
+                "branches=%s, keep=%s, range=%s, temperature=%s).",
+                self.conf_es_method,
+                self.conf_es_threshold,
+                self.conf_es_log_interval,
+                self.conf_es_replay_enabled,
+                self.conf_es_branches,
+                self.conf_es_keep,
+                self.conf_es_sample_range,
+                self.conf_es_temperature,
+            )
 
         self.eplb_state: EplbState | None = None
         """
@@ -2538,11 +2589,292 @@ class GPUModelRunner(
             ec_connector_output,
         )
 
+    def _get_conf_es_config(self, req_index: int) -> dict[str, Any] | None:
+        req_id = self.input_batch.req_ids[req_index]
+        sampling_params = self.requests[req_id].sampling_params
+        if sampling_params is not None and sampling_params.extra_args is not None:
+            config = sampling_params.extra_args.get("conf_es")
+            if config:
+                return config
+        if not self.conf_es_enabled:
+            return None
+        return {
+            "threshold": self.conf_es_threshold,
+            "method": self.conf_es_method,
+            "replay": self.conf_es_replay_enabled,
+            "branches": self.conf_es_branches,
+            "keep": self.conf_es_keep,
+            "range": self.conf_es_sample_range,
+            "temperature": self.conf_es_temperature,
+        }
+
+    def _get_conf_es_batch_config(
+        self,
+        num_logits: int,
+    ) -> tuple[dict[str, Any] | None, torch.Tensor | None]:
+        configs: list[dict[str, Any] | None] = [
+            self._get_conf_es_config(req_index) for req_index in range(num_logits)
+        ]
+        enabled_indices = [
+            req_index for req_index, config in enumerate(configs) if config is not None
+        ]
+        if not enabled_indices:
+            return None, None
+
+        first_config = configs[enabled_indices[0]]
+        assert first_config is not None
+        for req_index in enabled_indices[1:]:
+            if configs[req_index] != first_config:
+                logger.warning_once(
+                    "Mixed per-request confidence-ES configs in one batch are "
+                    "not supported by the prototype; using the first config."
+                )
+                break
+        enabled_mask = torch.zeros(num_logits, dtype=torch.bool, device=self.device)
+        enabled_mask[enabled_indices] = True
+        return first_config, enabled_mask
+
+    @staticmethod
+    def _conf_es_confidence(logits: torch.Tensor, method: str) -> torch.Tensor:
+        if method == "random_prob":
+            return torch.rand(logits.shape[:-1], device=logits.device)
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        if method == "deepconf_topk":
+            topk = min(20, log_probs.shape[-1])
+            return -log_probs.topk(k=topk, dim=-1).values.mean(dim=-1)
+        probs = log_probs.exp()
+        if method == "max_prob":
+            return probs.max(dim=-1).values
+        if method == "top1_top2_margin":
+            top2_probs = probs.topk(k=2, dim=-1).values
+            return top2_probs[:, 0] - top2_probs[:, 1]
+        raise ValueError(
+            "VLLM_CONF_ES_METHOD must be 'max_prob', 'top1_top2_margin', "
+            f"'deepconf_topk', or 'random_prob', got {method!r}."
+        )
+
+    def _maybe_log_conf_es_low_confidence(
+        self,
+        logits: torch.Tensor | None,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> torch.Tensor | None:
+        if (
+            logits is None
+            or spec_decode_metadata is not None
+        ):
+            return None
+
+        config, enabled_mask = self._get_conf_es_batch_config(logits.shape[0])
+        if config is None or enabled_mask is None:
+            return None
+
+        method = config.get("method", "max_prob")
+        threshold = float(config.get("threshold", 0.7))
+        confidence = self._conf_es_confidence(logits, method)
+        low_confidence = (confidence < threshold) & enabled_mask
+        self.conf_es_step += 1
+        if (
+            low_confidence.any()
+            and self.conf_es_step % self.conf_es_log_interval == 0
+        ):
+            low_count = int(low_confidence.sum().item())
+            min_confidence = float(confidence.min().item())
+            mean_confidence = float(confidence.mean().item())
+            logger.info(
+                "vLLM confidence-ES trigger candidates: low=%s/%s "
+                "method=%s threshold=%s min=%.6f mean=%.6f",
+                low_count,
+                int(enabled_mask.sum().item()),
+                method,
+                threshold,
+                min_confidence,
+                mean_confidence,
+            )
+        return low_confidence
+
+    @staticmethod
+    def _flatten_kv_cache_for_conf_es_slots(
+        kv_cache: torch.Tensor,
+    ) -> torch.Tensor | None:
+        # The prototype supports decoder attention KV cache layouts whose first
+        # dimensions are [K/V, num_blocks, block_size, ...]. This covers the
+        # standard OLMoE FlashAttention path.
+        if kv_cache.dim() < 3 or kv_cache.shape[0] != 2:
+            return None
+        return kv_cache.reshape(2, -1, *kv_cache.shape[3:])
+
+    def _save_conf_es_kv_slots(
+        self,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+        if len(self.kv_cache_config.kv_cache_groups) != 1:
+            return torch.empty(0, dtype=torch.long, device=self.device), []
+
+        slot_mapping = self.input_batch.block_table[0].slot_mapping.gpu[:num_tokens]
+        slot_ids = torch.unique(slot_mapping[slot_mapping >= 0]).long()
+        if slot_ids.numel() == 0:
+            return slot_ids, []
+
+        saved: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        seen_cache_ptrs: set[int] = set()
+        for kv_cache in self.kv_caches:
+            if kv_cache.data_ptr() in seen_cache_ptrs:
+                continue
+            seen_cache_ptrs.add(kv_cache.data_ptr())
+
+            flat_cache = self._flatten_kv_cache_for_conf_es_slots(kv_cache)
+            if flat_cache is None or int(slot_ids.max().item()) >= flat_cache.shape[1]:
+                return slot_ids, []
+            saved.append((flat_cache, slot_ids, flat_cache.index_select(1, slot_ids).clone()))
+
+        return slot_ids, saved
+
+    @staticmethod
+    def _restore_conf_es_kv_slots(
+        saved_slots: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> None:
+        for flat_cache, slot_ids, saved_values in saved_slots:
+            flat_cache.index_copy_(1, slot_ids, saved_values)
+
+    def _maybe_apply_conf_es_branch_replay(
+        self,
+        logits: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None,
+        model_kwargs: dict[str, Any],
+        attn_metadata: PerLayerAttnMetadata,
+        num_tokens: int,
+        num_tokens_across_dp: torch.Tensor | None,
+        batch_desc: BatchDescriptor,
+        ubatch_slices: UBatchSlices | None,
+        logits_indices: torch.Tensor,
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> torch.Tensor:
+        if (
+            spec_decode_metadata is not None
+            or logits is None
+        ):
+            return logits
+        config, enabled_mask = self._get_conf_es_batch_config(logits.shape[0])
+        if config is None or enabled_mask is None or not bool(config.get("replay", False)):
+            return logits
+        if (
+            self.use_aux_hidden_state_outputs
+            or not get_pp_group().is_last_rank
+            or get_pp_group().world_size != 1
+        ):
+            return logits
+        if num_scheduled_tokens_np.size == 0 or not np.all(num_scheduled_tokens_np == 1):
+            return logits
+
+        method = config.get("method", "max_prob")
+        threshold = float(config.get("threshold", 0.7))
+        confidence = self._conf_es_confidence(logits, method)
+        low_confidence = (confidence < threshold) & enabled_mask
+        enabled_indices = enabled_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
+        for req_index in enabled_indices:
+            req_id = self.input_batch.req_ids[req_index]
+            stats = self.conf_es_step_stats.setdefault(req_id, {"low": 0, "total": 0})
+            stats["total"] += 1
+            if bool(low_confidence[req_index].item()):
+                stats["low"] += 1
+        if not low_confidence.any():
+            return logits
+        self.conf_es_step += 1
+        if self.conf_es_step % self.conf_es_log_interval == 0:
+            logger.info(
+                "vLLM confidence-ES replay: low=%s/%s method=%s threshold=%s",
+                int(low_confidence.sum().item()),
+                int(enabled_mask.sum().item()),
+                method,
+                threshold,
+            )
+
+        low_indices = low_confidence.nonzero(as_tuple=False).squeeze(-1)
+        _slot_ids, saved_slots = self._save_conf_es_kv_slots(num_tokens)
+        if not saved_slots:
+            logger.warning_once(
+                "Skipping vLLM confidence-ES replay because the current KV "
+                "cache layout is not supported by the prototype."
+            )
+            return logits
+
+        try:
+            from vllm.model_executor.models.olmoe import enable_olmoe_expert_sample
+        except ImportError:
+            logger.warning_once(
+                "Skipping vLLM confidence-ES replay because OLMoE Expert-Sample "
+                "routing is unavailable."
+            )
+            return logits
+
+        branch_probs: list[torch.Tensor] = []
+        try:
+            branches = max(1, int(config.get("branches", 4)))
+            keep = config.get("keep")
+            sample_range = config.get("range")
+            temperature = float(config.get("temperature", 1.0))
+            for _branch_idx in range(branches):
+                with (
+                    enable_olmoe_expert_sample(
+                        self.get_model(),
+                        keep=keep,
+                        sample_range=sample_range,
+                        temperature=temperature,
+                    ),
+                    set_forward_context(
+                        attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                        batch_descriptor=batch_desc,
+                        ubatch_slices=ubatch_slices,
+                    ),
+                    record_function_or_nullcontext("gpu_model_runner: conf_es_replay"),
+                ):
+                    branch_output = self._model_forward(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
+
+                assert not isinstance(branch_output, tuple)
+                assert not isinstance(branch_output, IntermediateTensors)
+                branch_hidden_states = branch_output
+                branch_sample_hidden_states = branch_hidden_states[logits_indices]
+                branch_logits = self.model.compute_logits(branch_sample_hidden_states)
+                branch_probs.append(
+                    torch.softmax(branch_logits[low_indices].float(), dim=-1)
+                )
+                self._restore_conf_es_kv_slots(saved_slots)
+        finally:
+            self._restore_conf_es_kv_slots(saved_slots)
+
+        averaged_probs = torch.stack(branch_probs, dim=0).mean(dim=0)
+        replay_logits = logits.clone()
+        replay_logits[low_indices] = torch.log(
+            averaged_probs.clamp_min(torch.finfo(averaged_probs.dtype).tiny)
+        ).to(dtype=replay_logits.dtype)
+        return replay_logits
+
     def _sample(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> SamplerOutput:
+        config = None
+        if logits is not None:
+            config, _enabled_mask = self._get_conf_es_batch_config(logits.shape[0])
+        replay_enabled = bool(config and config.get("replay", False))
+        if not self.conf_es_replay_enabled and not replay_enabled:
+            self._maybe_log_conf_es_low_confidence(logits, spec_decode_metadata)
+
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
@@ -3058,6 +3390,24 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+            if logits is not None:
+                logits = self._maybe_apply_conf_es_branch_replay(
+                    logits=logits,
+                    spec_decode_metadata=spec_decode_metadata,
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    model_kwargs=model_kwargs,
+                    attn_metadata=attn_metadata,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    batch_desc=batch_desc,
+                    ubatch_slices=ubatch_slices,
+                    logits_indices=logits_indices,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                )
+
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -3217,7 +3567,9 @@ class GPUModelRunner(
                 if self.supports_mm_inputs
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
+                conf_es_stats=self.conf_es_step_stats or None,
             )
+            self.conf_es_step_stats = {}
 
         if not self.use_async_scheduling:
             return output

@@ -19,6 +19,26 @@ from vllm.v1.metrics.stats import RequestStateStats
 logger = init_logger(__name__)
 
 
+def _merge_kv_transfer_params(
+    current: dict[str, Any] | None,
+    incoming: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if current is None:
+        return incoming
+    if incoming is None:
+        return current
+    merged = dict(current)
+    merged.update(incoming)
+    current_conf_es = current.get("conf_es_stats")
+    incoming_conf_es = incoming.get("conf_es_stats")
+    if isinstance(current_conf_es, dict) and isinstance(incoming_conf_es, dict):
+        merged["conf_es_stats"] = {
+            "low": int(current_conf_es.get("low", 0)) + int(incoming_conf_es.get("low", 0)),
+            "total": int(current_conf_es.get("total", 0)) + int(incoming_conf_es.get("total", 0)),
+        }
+    return merged
+
+
 @dataclass
 class CompletionOutput:
     """The output data of one completion output of a request.
@@ -147,7 +167,10 @@ class RequestOutput:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
-        self.kv_transfer_params = next_output.kv_transfer_params
+        self.kv_transfer_params = _merge_kv_transfer_params(
+            self.kv_transfer_params,
+            next_output.kv_transfer_params,
+        )
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):

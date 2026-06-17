@@ -14,9 +14,12 @@
 # limitations under the License.
 """Inference-only OLMoE model compatible with HuggingFace weights."""
 
+import os
 from collections.abc import Iterable
+from contextlib import contextmanager
 from functools import partial
 from itertools import islice
+from typing import Iterator
 
 import torch
 from torch import nn
@@ -61,6 +64,148 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_optional_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return None
+    return int(value)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return float(value)
+
+
+def _sample_gumbel_like(tensor: torch.Tensor) -> torch.Tensor:
+    uniform = torch.rand_like(tensor, dtype=torch.float32).clamp_(1e-6, 1.0 - 1e-6)
+    return -torch.log(-torch.log(uniform))
+
+
+def _expert_sample_indices(
+    router_logits: torch.Tensor,
+    top_k: int,
+    keep: int | None,
+    sample_range: int | None,
+    temperature: float,
+) -> torch.Tensor:
+    num_experts = router_logits.shape[-1]
+    keep = top_k // 2 + 1 if keep is None else keep
+    sample_range = min(num_experts, 4 * top_k if sample_range is None else sample_range)
+
+    if keep < 0:
+        raise ValueError("VLLM_OLMOE_ES_KEEP must be non-negative.")
+    if keep > top_k:
+        raise ValueError(
+            f"VLLM_OLMOE_ES_KEEP must be <= top_k ({top_k}), got {keep}."
+        )
+    if sample_range < top_k:
+        raise ValueError(
+            f"VLLM_OLMOE_ES_RANGE must be >= top_k ({top_k}), got "
+            f"{sample_range}."
+        )
+    if sample_range > num_experts:
+        raise ValueError(
+            f"VLLM_OLMOE_ES_RANGE must be <= num_experts ({num_experts}), "
+            f"got {sample_range}."
+        )
+    if temperature < 0:
+        raise ValueError("VLLM_OLMOE_ES_TEMPERATURE must be non-negative.")
+
+    ranked_logits, ranked_indices = torch.topk(
+        router_logits.float(), k=sample_range, dim=-1
+    )
+    head_indices = ranked_indices[..., :keep]
+    tail_slots = top_k - keep
+    if tail_slots == 0:
+        return head_indices
+
+    tail_logits = ranked_logits[..., keep:sample_range]
+    tail_indices = ranked_indices[..., keep:sample_range]
+    if tail_indices.shape[-1] < tail_slots:
+        raise ValueError(
+            "VLLM_OLMOE_ES_RANGE leaves too few tail candidates for "
+            f"{tail_slots} sampled expert slots."
+        )
+
+    if temperature == 0.0:
+        sampled_tail_positions = torch.topk(tail_logits, k=tail_slots, dim=-1).indices
+    else:
+        sampled_tail_positions = torch.topk(
+            tail_logits / temperature + _sample_gumbel_like(tail_logits),
+            k=tail_slots,
+            dim=-1,
+        ).indices
+    sampled_tail_indices = tail_indices.gather(dim=-1, index=sampled_tail_positions)
+    return torch.cat([head_indices, sampled_tail_indices], dim=-1)
+
+
+def _make_expert_sample_routing_function(
+    keep: int | None,
+    sample_range: int | None,
+    temperature: float,
+):
+    def expert_sample_routing(
+        hidden_states: torch.Tensor,
+        gating_output: torch.Tensor,
+        topk: int,
+        renormalize: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del hidden_states
+        topk_ids = _expert_sample_indices(
+            router_logits=gating_output,
+            top_k=topk,
+            keep=keep,
+            sample_range=sample_range,
+            temperature=temperature,
+        )
+        router_probs = torch.softmax(gating_output.float(), dim=-1)
+        topk_weights = router_probs.gather(dim=-1, index=topk_ids)
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        return topk_weights, topk_ids
+
+    return expert_sample_routing
+
+
+@contextmanager
+def enable_olmoe_expert_sample(
+    model: nn.Module,
+    keep: int | None,
+    sample_range: int | None,
+    temperature: float,
+) -> Iterator[None]:
+    """Temporarily enable Expert-Sample routing for all OLMoE MoE layers.
+
+    This is intended for branch replay: the main decode path can keep the
+    normal deterministic router, while short-lived branch forwards install an
+    Expert-Sample routing function and restore the previous routing state when
+    they finish.
+    """
+    routing_function = _make_expert_sample_routing_function(
+        keep=keep,
+        sample_range=sample_range,
+        temperature=temperature,
+    )
+    olmoe_layers = [module for module in model.modules() if isinstance(module, OlmoeMoE)]
+    previous = [
+        (layer, layer.experts.custom_routing_function) for layer in olmoe_layers
+    ]
+
+    try:
+        for layer, _old_routing_function in previous:
+            layer.experts.custom_routing_function = routing_function
+        yield
+    finally:
+        for layer, old_routing_function in previous:
+            layer.experts.custom_routing_function = old_routing_function
+
+
 class OlmoeMoE(nn.Module):
     """A tensor-parallel MoE implementation for Olmoe that shards each expert
     across all ranks.
@@ -100,6 +245,28 @@ class OlmoeMoE(nn.Module):
             tp_size=tp_size,
             prefix=f"{prefix}.experts",
         )
+        if _env_flag("VLLM_OLMOE_EXPERT_SAMPLE"):
+            keep = _env_optional_int("VLLM_OLMOE_ES_KEEP")
+            sample_range = _env_optional_int("VLLM_OLMOE_ES_RANGE")
+            temperature = _env_float("VLLM_OLMOE_ES_TEMPERATURE", 1.0)
+            effective_keep = top_k // 2 + 1 if keep is None else keep
+            effective_sample_range = min(
+                num_experts,
+                4 * top_k if sample_range is None else sample_range,
+            )
+            self.experts.custom_routing_function = _make_expert_sample_routing_function(
+                keep=keep,
+                sample_range=sample_range,
+                temperature=temperature,
+            )
+            logger.info(
+                "Enabled static OLMoE Expert-Sample routing for %s "
+                "(keep=%s, range=%s, temperature=%s).",
+                prefix,
+                effective_keep,
+                effective_sample_range,
+                temperature,
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
