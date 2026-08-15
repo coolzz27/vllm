@@ -326,7 +326,9 @@ class RequestState:
         if self.parent_req is None:
             outputs = [output]
         else:
-            outputs, finished = self.parent_req.get_outputs(self.request_id, output)
+            outputs, finished, kv_transfer_params = self.parent_req.get_outputs(
+                self.request_id, output, kv_transfer_params
+            )
             if not outputs:
                 return None
             external_req_id = self.parent_req.external_req_id

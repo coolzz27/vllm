@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from copy import copy
-from typing import cast
+from typing import Any, cast
 
-from vllm.outputs import CompletionOutput
+from vllm.outputs import CompletionOutput, _merge_kv_transfer_params
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.metrics.stats import IterationStats
@@ -33,6 +33,9 @@ class ParentRequest:
     # To efficiently obtain child sampling params
     cached_child_sampling_params: SamplingParams | None
 
+    # To aggregate per-child auxiliary output parameters.
+    kv_transfer_params_aggregator: dict[str, Any] | None
+
     def __init__(self, request: EngineCoreRequest) -> None:
         assert request.external_req_id is not None
         sampling_params = request.params
@@ -48,6 +51,7 @@ class ParentRequest:
         )
         self.max_num_generation_tokens = 0
         self.cached_child_sampling_params = None
+        self.kv_transfer_params_aggregator = None
 
     def _get_child_sampling_params(
         self,
@@ -101,7 +105,8 @@ class ParentRequest:
         self,
         child_request_id: str,
         completion_output: CompletionOutput,
-    ) -> tuple[list[CompletionOutput], bool]:
+        kv_transfer_params: dict[str, Any] | None = None,
+    ) -> tuple[list[CompletionOutput], bool, dict[str, Any] | None]:
         already_finished_and_returned: bool = False
         if completion_output.finished():
             if child_request_id in self.child_requests:
@@ -111,6 +116,11 @@ class ParentRequest:
                 # which means the request had finished in previous
                 # batch step and returned to the client earlier
                 already_finished_and_returned = True
+
+        if not already_finished_and_returned:
+            self.kv_transfer_params_aggregator = _merge_kv_transfer_params(
+                self.kv_transfer_params_aggregator, kv_transfer_params
+            )
 
         if self.sampling_params.output_kind != RequestOutputKind.FINAL_ONLY:
             # If streaming, just return the current output
@@ -123,7 +133,10 @@ class ParentRequest:
             outputs = [] if self.child_requests else self.output_aggregator
 
         finished = not self.child_requests
-        return outputs, finished
+        output_kv_transfer_params = (
+            self.kv_transfer_params_aggregator if finished else kv_transfer_params
+        )
+        return outputs, finished, output_kv_transfer_params
 
     def observe_num_generation_tokens(self, num_generation_tokens: int):
         self.max_num_generation_tokens = max(

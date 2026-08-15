@@ -1689,6 +1689,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        conf_es_stats = model_runner_output.conf_es_stats
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -1920,6 +1921,9 @@ class Scheduler(SchedulerInterface):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
+                    if stats := conf_es_stats.get(req_id):
+                        kv_transfer_params = dict(kv_transfer_params or {})
+                        kv_transfer_params["conf_es_stats"] = stats
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)

@@ -14,7 +14,8 @@
 # limitations under the License.
 """Inference-only OLMoE model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from functools import partial
 from itertools import islice
 
@@ -60,6 +61,52 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _expert_sample_router_logits(
+    router_logits: torch.Tensor,
+    top_k: int,
+    keep: int | None,
+    sample_range: int | None,
+    temperature: float,
+) -> torch.Tensor:
+    num_experts = router_logits.shape[-1]
+    keep = top_k // 2 + 1 if keep is None else int(keep)
+    sample_range = min(
+        num_experts, 4 * top_k if sample_range is None else int(sample_range)
+    )
+    if not 0 <= keep <= top_k:
+        raise ValueError(f"Expert-Sample keep must be in [0, {top_k}], got {keep}.")
+    if not top_k <= sample_range <= num_experts:
+        raise ValueError(
+            "Expert-Sample range must be between top_k "
+            f"({top_k}) and num_experts ({num_experts}), got {sample_range}."
+        )
+    if temperature < 0:
+        raise ValueError("Expert-Sample temperature must be nonnegative.")
+
+    ranked_logits, ranked_indices = torch.topk(
+        router_logits.float(), k=sample_range, dim=-1
+    )
+    selected = ranked_indices[..., :keep]
+    tail_slots = top_k - keep
+    if tail_slots:
+        tail_logits = ranked_logits[..., keep:]
+        if temperature == 0:
+            tail_positions = torch.topk(tail_logits, k=tail_slots, dim=-1).indices
+        else:
+            uniform = torch.rand_like(tail_logits).clamp_(1e-6, 1 - 1e-6)
+            gumbel = -torch.log(-torch.log(uniform))
+            tail_positions = torch.topk(
+                tail_logits / temperature + gumbel, k=tail_slots, dim=-1
+            ).indices
+        sampled_tail = ranked_indices[..., keep:].gather(-1, tail_positions)
+        selected = torch.cat((selected, sampled_tail), dim=-1)
+
+    sampled_logits = torch.full_like(
+        router_logits, torch.finfo(router_logits.dtype).min
+    )
+    return sampled_logits.scatter(-1, selected, router_logits.gather(-1, selected))
+
+
 class OlmoeMoE(nn.Module):
     """A tensor-parallel MoE implementation for Olmoe that shards each expert
     across all ranks.
@@ -82,6 +129,11 @@ class OlmoeMoE(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
+        self.top_k = top_k
+        self._expert_sample_enabled = False
+        self._expert_sample_keep: int | None = None
+        self._expert_sample_range: int | None = None
+        self._expert_sample_temperature = 1.0
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
@@ -110,10 +162,52 @@ class OlmoeMoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        if self._expert_sample_enabled:
+            router_logits = _expert_sample_router_logits(
+                router_logits,
+                self.top_k,
+                self._expert_sample_keep,
+                self._expert_sample_range,
+                self._expert_sample_temperature,
+            )
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
         return final_hidden_states.view(orig_shape)
+
+
+@contextmanager
+def enable_olmoe_expert_sample(
+    model: nn.Module,
+    keep: int | None = None,
+    sample_range: int | None = None,
+    temperature: float = 1.0,
+) -> Iterator[None]:
+    moe_layers = [module for module in model.modules() if isinstance(module, OlmoeMoE)]
+    previous = [
+        (
+            layer._expert_sample_enabled,
+            layer._expert_sample_keep,
+            layer._expert_sample_range,
+            layer._expert_sample_temperature,
+        )
+        for layer in moe_layers
+    ]
+    try:
+        for layer in moe_layers:
+            layer._expert_sample_enabled = True
+            layer._expert_sample_keep = keep
+            layer._expert_sample_range = sample_range
+            layer._expert_sample_temperature = float(temperature)
+        yield
+    finally:
+        for layer, state in zip(moe_layers, previous):
+            (
+                layer._expert_sample_enabled,
+                layer._expert_sample_keep,
+                layer._expert_sample_range,
+                layer._expert_sample_temperature,
+            ) = state
 
 
 class OlmoeAttention(nn.Module):

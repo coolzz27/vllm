@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import math
+import os
 import threading
 import time
 from collections import defaultdict
@@ -587,6 +589,52 @@ class GPUModelRunner(
             logprobs_mode=self.model_config.logprobs_mode,
             use_fp64_gumbel=self.model_config.use_fp64_gumbel,
         )
+
+        env_enabled = os.environ.get("VLLM_CONF_ES", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self.conf_es_enabled = env_enabled
+        self.conf_es_threshold = float(os.environ.get("VLLM_CONF_ES_THRESHOLD", "0.7"))
+        self.conf_es_method = os.environ.get("VLLM_CONF_ES_METHOD", "max_prob")
+        self.conf_es_replay_enabled = os.environ.get(
+            "VLLM_CONF_ES_REPLAY", ""
+        ).lower() in ("1", "true", "yes", "on")
+        self.conf_es_branches = max(
+            1, int(os.environ.get("VLLM_CONF_ES_BRANCHES", "4"))
+        )
+        self.conf_es_keep = (
+            int(value) if (value := os.environ.get("VLLM_CONF_ES_KEEP")) else None
+        )
+        self.conf_es_sample_range = (
+            int(value) if (value := os.environ.get("VLLM_CONF_ES_RANGE")) else None
+        )
+        self.conf_es_temperature = float(
+            os.environ.get("VLLM_CONF_ES_TEMPERATURE", "1.0")
+        )
+        self.conf_es_replay_merge = os.environ.get(
+            "VLLM_CONF_ES_REPLAY_MERGE", "prob_avg"
+        )
+        self.conf_es_window_size = max(
+            1, int(os.environ.get("VLLM_CONF_ES_WINDOW_SIZE", "8"))
+        )
+        self.conf_es_warmup_tokens = max(
+            0, int(os.environ.get("VLLM_CONF_ES_WARMUP_TOKENS", "8"))
+        )
+        self.conf_es_trigger_warmup_tokens = max(
+            0, int(os.environ.get("VLLM_CONF_ES_TRIGGER_WARMUP_TOKENS", "64"))
+        )
+        self.conf_es_log_interval = max(
+            0, int(os.environ.get("VLLM_CONF_ES_LOG_INTERVAL", "0"))
+        )
+        self.conf_es_step = 0
+        self.conf_es_request_stats: dict[str, dict[str, int]] = {}
+        self.conf_es_window_history: dict[str, list[float]] = {}
+        self.conf_es_token_filter_cache: dict[
+            tuple[str, tuple[int, ...]], torch.Tensor
+        ] = {}
 
         self.eplb_state: EplbState | None = None
         self._moe_model: MixtureOfExperts | None = None
@@ -1220,7 +1268,9 @@ class GPUModelRunner(
         req_state: CachedRequestState | None,
     ) -> None:
         """Hook for platform runners to clean request-scoped side caches."""
-        del req_id, req_state
+        self.conf_es_request_stats.pop(req_id, None)
+        self.conf_es_window_history.pop(req_id, None)
+        del req_state
 
     def _process_encoder_cache_scheduler_output(
         self,
@@ -3729,6 +3779,416 @@ class GPUModelRunner(
             ec_connector_output,
         )
 
+    def _get_extra_args_config(self, req_index: int, key: str) -> dict[str, Any] | None:
+        req_id = self.input_batch.req_ids[req_index]
+        sampling_params = self.requests[req_id].sampling_params
+        if sampling_params is None or sampling_params.extra_args is None:
+            return None
+        config = sampling_params.extra_args.get(key)
+        return config if isinstance(config, dict) and config else None
+
+    def _get_batch_extra_args_config(
+        self, num_reqs: int, key: str
+    ) -> dict[str, Any] | None:
+        configs = [self._get_extra_args_config(i, key) for i in range(num_reqs)]
+        enabled = [config for config in configs if config is not None]
+        if not enabled:
+            return None
+        if len(enabled) != len(configs) or any(
+            config != enabled[0] for config in enabled[1:]
+        ):
+            logger.warning_once(
+                "Mixed %s configurations in one batch are unsupported; "
+                "using the first enabled configuration.",
+                key,
+            )
+        return enabled[0]
+
+    def _get_conf_es_config(self, req_index: int) -> dict[str, Any] | None:
+        config = self._get_extra_args_config(req_index, "conf_es")
+        if config is not None:
+            return config
+        if not self.conf_es_enabled:
+            return None
+        return {
+            "threshold": self.conf_es_threshold,
+            "method": self.conf_es_method,
+            "replay": self.conf_es_replay_enabled,
+            "branches": self.conf_es_branches,
+            "keep": self.conf_es_keep,
+            "range": self.conf_es_sample_range,
+            "temperature": self.conf_es_temperature,
+            "replay_merge": self.conf_es_replay_merge,
+            "window_size": self.conf_es_window_size,
+            "warmup_tokens": self.conf_es_warmup_tokens,
+            "trigger_warmup_tokens": self.conf_es_trigger_warmup_tokens,
+            "log_interval": self.conf_es_log_interval,
+        }
+
+    @contextmanager
+    def _maybe_enable_expert_sample(
+        self, config: dict[str, Any] | None
+    ) -> Iterator[None]:
+        if config is None:
+            yield
+            return
+        from vllm.model_executor.layers.fused_moe.expert_sample import (
+            enable_expert_sample,
+        )
+
+        with enable_expert_sample(
+            keep=config.get("keep"),
+            sample_range=config.get("range"),
+            temperature=float(config.get("temperature", 1.0)),
+        ):
+            yield
+
+    @staticmethod
+    def _conf_es_confidence(logits: torch.Tensor, method: str) -> torch.Tensor:
+        if method == "random_prob":
+            return torch.rand(logits.shape[:-1], device=logits.device)
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        if method in ("deepconf_topk", "deepconf_window_topk"):
+            topk = min(20, log_probs.shape[-1])
+            return -log_probs.topk(k=topk, dim=-1).values.mean(dim=-1)
+        if method in ("entropy", "normalized_entropy"):
+            probs = log_probs.exp()
+            entropy = -(probs * log_probs).sum(dim=-1)
+            if method == "normalized_entropy":
+                entropy = entropy / math.log(log_probs.shape[-1])
+            return entropy
+        probs = log_probs.exp()
+        if method == "max_prob":
+            return probs.max(dim=-1).values
+        if method == "top1_top2_margin":
+            top2 = probs.topk(k=2, dim=-1).values
+            return top2[:, 0] - top2[:, 1]
+        raise ValueError(f"Unknown confidence-ES method: {method!r}")
+
+    @staticmethod
+    def _conf_es_is_low(
+        confidence: torch.Tensor, threshold: float, method: str
+    ) -> torch.Tensor:
+        if method in ("entropy", "normalized_entropy"):
+            return confidence > threshold
+        return confidence < threshold
+
+    def _conf_es_trigger_confidence(
+        self,
+        logits: torch.Tensor,
+        method: str,
+        config: dict[str, Any],
+        enabled_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if method != "deepconf_window_topk":
+            return self._conf_es_confidence(logits, method)
+        token_confidence = self._conf_es_confidence(logits, "deepconf_topk")
+        confidence = token_confidence.clone()
+        window_size = max(1, int(config.get("window_size", 8)))
+        warmup_tokens = max(0, int(config.get("warmup_tokens", 8)))
+        for req_index in enabled_mask.nonzero(as_tuple=False).flatten().tolist():
+            req_id = self.input_batch.req_ids[req_index]
+            history = self.conf_es_window_history.setdefault(req_id, [])
+            history.append(float(token_confidence[req_index].item()))
+            if len(history) < warmup_tokens:
+                confidence[req_index] = float("inf")
+            else:
+                window = history[-window_size:]
+                confidence[req_index] = sum(window) / len(window)
+        return confidence
+
+    def _conf_es_token_filter_mask(
+        self, logits: torch.Tensor, config: dict[str, Any]
+    ) -> torch.Tensor:
+        if config.get("token_filter") != "reasoning_candidate":
+            return torch.ones(logits.shape[0], dtype=torch.bool, device=logits.device)
+        token_ids = tuple(
+            sorted(
+                {int(token_id) for token_id in config.get("reasoning_token_ids", [])}
+            )
+        )
+        if not token_ids:
+            return torch.zeros(logits.shape[0], dtype=torch.bool, device=logits.device)
+        next_token_ids = logits.argmax(dim=-1)
+        cache_key = (str(next_token_ids.device), token_ids)
+        allowed = self.conf_es_token_filter_cache.get(cache_key)
+        if allowed is None:
+            allowed = torch.tensor(
+                token_ids, dtype=next_token_ids.dtype, device=next_token_ids.device
+            )
+            self.conf_es_token_filter_cache[cache_key] = allowed
+        return torch.isin(next_token_ids, allowed)
+
+    def _conf_es_stats_for_req(self, req_id: str) -> dict[str, int]:
+        stats = self.conf_es_request_stats.setdefault(req_id, {})
+        for key in ("low", "total", "eligible", "replay_total", "replay_changed"):
+            stats.setdefault(key, 0)
+        stats.setdefault("stats_version", 3)
+        return stats
+
+    @staticmethod
+    def _conf_es_sample_tokens(
+        logits: torch.Tensor, temperature: float, top_p: float
+    ) -> torch.Tensor:
+        if temperature <= 0:
+            return logits.argmax(dim=-1)
+        scaled = logits.float() / temperature
+        if top_p < 1:
+            sorted_logits, sorted_indices = scaled.sort(descending=True, dim=-1)
+            cumulative = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+            remove = cumulative > top_p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            sorted_logits.masked_fill_(remove, torch.finfo(sorted_logits.dtype).min)
+            scaled = torch.full_like(scaled, torch.finfo(scaled.dtype).min).scatter(
+                -1, sorted_indices, sorted_logits
+            )
+        return torch.multinomial(scaled.softmax(dim=-1), 1).squeeze(-1)
+
+    @staticmethod
+    def _conf_es_unique_votes(
+        branch_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        positions = branch_token_ids.shape[1]
+        winners = torch.empty(
+            positions, dtype=branch_token_ids.dtype, device=branch_token_ids.device
+        )
+        valid = torch.zeros(positions, dtype=torch.bool, device=branch_token_ids.device)
+        for position in range(positions):
+            token_ids, counts = torch.unique(
+                branch_token_ids[:, position], return_counts=True
+            )
+            candidates = token_ids[counts == counts.max()]
+            if candidates.numel() == 1:
+                winners[position] = candidates[0]
+                valid[position] = True
+        return winners, valid
+
+    def _save_conf_es_kv_blocks(
+        self, slot_mappings_by_group: dict[int, torch.Tensor] | None
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not slot_mappings_by_group or not self.kv_caches:
+            return []
+        block_sizes = {
+            group.kv_cache_spec.block_size
+            for group in self.kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, AttentionSpec)
+        }
+        if len(block_sizes) != 1:
+            return []
+        block_size = block_sizes.pop()
+        slot_ids = torch.cat(
+            [mapping.flatten() for mapping in slot_mappings_by_group.values()]
+        )
+        slot_ids = slot_ids[slot_ids >= 0]
+        if not slot_ids.numel():
+            return []
+        block_ids = torch.unique(slot_ids.div(block_size, rounding_mode="floor")).long()
+        num_blocks = self.kv_cache_config.num_blocks
+        saved: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        seen: set[int] = set()
+        for entry in self.kv_caches:
+            tensors = entry if isinstance(entry, (list, tuple)) else (entry,)
+            for tensor in tensors:
+                storage = tensor.untyped_storage()
+                pointer = storage.data_ptr()
+                if pointer in seen:
+                    continue
+                seen.add(pointer)
+                raw = torch.empty(0, dtype=torch.uint8, device=tensor.device)
+                raw.set_(storage)
+                if raw.numel() % num_blocks:
+                    return []
+                blocks = raw.view(num_blocks, -1)
+                saved.append((blocks, block_ids, blocks[block_ids].clone()))
+        return saved
+
+    @staticmethod
+    def _restore_conf_es_kv_blocks(
+        saved: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> None:
+        for blocks, block_ids, values in saved:
+            blocks.index_copy_(0, block_ids, values)
+
+    def _maybe_apply_conf_es_replay(
+        self,
+        logits: torch.Tensor,
+        scheduler_output: "SchedulerOutput",
+        attn_metadata: PerLayerAttnMetadata,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None,
+        model_kwargs: dict[str, Any],
+        logits_indices: torch.Tensor,
+        num_tokens_padded: int,
+        num_tokens_across_dp: torch.Tensor | None,
+        slot_mappings_by_group: dict[int, torch.Tensor] | None,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        pre_forward_cache: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        num_reqs = self.input_batch.num_reqs
+        configs = [self._get_conf_es_config(i) for i in range(num_reqs)]
+        enabled_configs = [c for c in configs if c and c.get("replay", False)]
+        if not enabled_configs:
+            return logits
+        unsupported = (
+            self.speculative_config is not None
+            or self.parallel_config.data_parallel_size > 1
+            or self.dcp_world_size > 1
+            or get_pp_group().world_size > 1
+            or self.parallel_config.use_ubatching
+            or self.use_aux_hidden_state_outputs
+            or logits.shape[0] != num_reqs
+            or any(
+                scheduler_output.num_scheduled_tokens[r] != 1
+                for r in self.input_batch.req_ids
+            )
+        )
+        if unsupported:
+            logger.warning_once(
+                "Confidence-ES replay requires single-token decode without "
+                "speculative decoding, PP, DP, DCP, or ubatching."
+            )
+            return logits
+        enabled = torch.tensor(
+            [bool(c and c.get("replay", False)) for c in configs],
+            dtype=torch.bool,
+            device=logits.device,
+        )
+        config = enabled_configs[0]
+        method = str(config.get("method", "max_prob"))
+        confidence = self._conf_es_trigger_confidence(logits, method, config, enabled)
+        filtered = self._conf_es_token_filter_mask(logits, config)
+        warmup = max(0, int(config.get("trigger_warmup_tokens", 64)))
+        ready = torch.zeros_like(enabled)
+        for i in enabled.nonzero(as_tuple=False).flatten().tolist():
+            if (
+                self._conf_es_stats_for_req(self.input_batch.req_ids[i])["total"]
+                >= warmup
+            ):
+                ready[i] = True
+        eligible = enabled & filtered & ready
+        low = (
+            self._conf_es_is_low(
+                confidence, float(config.get("threshold", 0.7)), method
+            )
+            & eligible
+        )
+        for i in enabled.nonzero(as_tuple=False).flatten().tolist():
+            stats = self._conf_es_stats_for_req(self.input_batch.req_ids[i])
+            stats["total"] += 1
+            stats["eligible"] += int(eligible[i].item())
+            stats["low"] += int(low[i].item())
+        if not low.any():
+            return logits
+        low_indices = low.nonzero(as_tuple=False).flatten()
+        low_req_ids = [self.input_batch.req_ids[i] for i in low_indices.tolist()]
+        for req_id in low_req_ids:
+            self._conf_es_stats_for_req(req_id)["replay_total"] += 1
+        self.conf_es_step += 1
+        log_interval = max(0, int(config.get("log_interval", 0)))
+        if log_interval and self.conf_es_step % log_interval == 0:
+            logger.info(
+                "Confidence-ES replay low=%d enabled=%d method=%s",
+                int(low.sum().item()),
+                int(enabled.sum().item()),
+                method,
+            )
+        post_forward_cache = self._save_conf_es_kv_blocks(slot_mappings_by_group)
+        if not post_forward_cache:
+            logger.warning_once(
+                "Skipping confidence-ES replay: KV cache layout is unsupported."
+            )
+            return logits
+        branch_start_cache = pre_forward_cache or post_forward_cache
+        merge = str(config.get("replay_merge", "prob_avg"))
+        if merge not in ("prob_avg", "vote", "single_sample"):
+            merge = "prob_avg"
+        selection = str(config.get("vote_token_selection", "argmax"))
+        sample_temp = float(config.get("sampling_temperature", 0.0))
+        sample_top_p = float(config.get("sampling_top_p", 1.0))
+        sample_top_p = sample_top_p if 0 < sample_top_p <= 1 else 1.0
+        branches = (
+            1 if merge == "single_sample" else max(1, int(config.get("branches", 4)))
+        )
+        probs: list[torch.Tensor] = []
+        token_votes: list[torch.Tensor] = []
+        if merge == "vote":
+            base = logits[low_indices]
+            token_votes.append(
+                self._conf_es_sample_tokens(base, sample_temp, sample_top_p)
+                if selection == "sample"
+                else base.argmax(dim=-1)
+            )
+        self._restore_conf_es_kv_blocks(branch_start_cache)
+        try:
+            for _ in range(branches):
+                with (
+                    self._maybe_enable_expert_sample(config),
+                    set_forward_context(
+                        attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens_padded,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                        batch_descriptor=BatchDescriptor(num_tokens_padded),
+                        slot_mapping=slot_mappings,
+                        skip_compiled=True,
+                    ),
+                ):
+                    output = self._model_forward(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
+                assert isinstance(output, torch.Tensor)
+                branch_logits = self.model.compute_logits(output[logits_indices])[
+                    low_indices
+                ]
+                if merge in ("vote", "single_sample"):
+                    token_votes.append(
+                        self._conf_es_sample_tokens(
+                            branch_logits, sample_temp, sample_top_p
+                        )
+                        if merge == "single_sample" or selection == "sample"
+                        else branch_logits.argmax(dim=-1)
+                    )
+                if merge != "single_sample":
+                    probs.append(branch_logits.float().softmax(dim=-1))
+                self._restore_conf_es_kv_blocks(branch_start_cache)
+        finally:
+            self._restore_conf_es_kv_blocks(post_forward_cache)
+        replay = logits.clone()
+        if merge == "single_sample":
+            forced = torch.full_like(replay[low_indices], torch.finfo(replay.dtype).min)
+            forced.scatter_(1, token_votes[0].unsqueeze(-1).long(), 0)
+            replay[low_indices] = forced
+        else:
+            averaged = torch.stack(probs).mean(dim=0)
+            replay[low_indices] = (
+                averaged.clamp_min(torch.finfo(averaged.dtype).tiny)
+                .log()
+                .to(replay.dtype)
+            )
+        if merge == "vote":
+            winners, valid = self._conf_es_unique_votes(torch.stack(token_votes))
+            rows = valid.nonzero(as_tuple=False).flatten()
+            if rows.numel():
+                forced = torch.full_like(
+                    replay[low_indices[rows]], torch.finfo(replay.dtype).min
+                )
+                forced.scatter_(1, winners[rows].unsqueeze(-1).long(), 0)
+                replay[low_indices[rows]] = forced
+        changed = replay[low_indices].argmax(-1) != logits[low_indices].argmax(-1)
+        for row, req_id in enumerate(low_req_ids):
+            self._conf_es_stats_for_req(req_id)["replay_changed"] += int(
+                changed[row].item()
+            )
+        return replay
+
     def _sample(
         self,
         logits: torch.Tensor | None,
@@ -4466,6 +4926,17 @@ class GPUModelRunner(
                 num_tokens_unpadded,
                 ubatch_slices_padded,
             )
+        expert_sample_config = self._get_batch_extra_args_config(
+            num_reqs, "expert_sample"
+        )
+        pre_forward_cache: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        if self.kv_cache_config.has_mamba_layers and all(
+            scheduler_output.num_scheduled_tokens[req_id] == 1
+            for req_id in self.input_batch.req_ids
+        ):
+            conf_es_configs = [self._get_conf_es_config(i) for i in range(num_reqs)]
+            if any(c and c.get("replay", False) for c in conf_es_configs):
+                pre_forward_cache = self._save_conf_es_kv_blocks(slot_mappings_by_group)
         with (
             set_forward_context(
                 attn_metadata,
@@ -4476,9 +4947,10 @@ class GPUModelRunner(
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
+                skip_compiled=has_encoder_input or expert_sample_config is not None,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
+            self._maybe_enable_expert_sample(expert_sample_config),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
@@ -4549,6 +5021,23 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+        logits = self._maybe_apply_conf_es_replay(
+            logits,
+            scheduler_output,
+            attn_metadata,
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            model_kwargs,
+            logits_indices,
+            num_tokens_padded,
+            num_tokens_across_dp,
+            slot_mappings_by_group,
+            slot_mappings,
+            pre_forward_cache,
+        )
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -4815,6 +5304,11 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                conf_es_stats={
+                    req_id: dict(self.conf_es_request_stats[req_id])
+                    for req_id in req_ids_output_copy
+                    if req_id in self.conf_es_request_stats
+                },
             )
 
         if not self.use_async_scheduling:

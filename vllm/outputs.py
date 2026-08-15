@@ -18,6 +18,36 @@ from vllm.v1.metrics.stats import RequestStateStats
 logger = init_logger(__name__)
 
 
+def _merge_kv_transfer_params(
+    current: dict[str, Any] | None,
+    incoming: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if current is None:
+        return incoming
+    if incoming is None:
+        return current
+
+    merged = {**current, **incoming}
+    current_stats = current.get("conf_es_stats")
+    incoming_stats = incoming.get("conf_es_stats")
+    if isinstance(current_stats, dict) and isinstance(incoming_stats, dict):
+        merged_stats: dict[str, Any] = dict(current_stats)
+        for key, incoming_value in incoming_stats.items():
+            current_value = merged_stats.get(key)
+            if key == "stats_version":
+                merged_stats[key] = max(
+                    int(current_value or 0), int(incoming_value or 0)
+                )
+            elif isinstance(current_value, (int, float)) and isinstance(
+                incoming_value, (int, float)
+            ):
+                merged_stats[key] = current_value + incoming_value
+            else:
+                merged_stats[key] = incoming_value
+        merged["conf_es_stats"] = merged_stats
+    return merged
+
+
 @dataclass
 class CompletionOutput:
     """The output data of one completion output of a request.
@@ -153,7 +183,9 @@ class RequestOutput:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
-        self.kv_transfer_params = next_output.kv_transfer_params
+        self.kv_transfer_params = _merge_kv_transfer_params(
+            self.kv_transfer_params, next_output.kv_transfer_params
+        )
         self.ec_transfer_params = next_output.ec_transfer_params
 
         for next_completion in next_output.outputs:

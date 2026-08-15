@@ -25,6 +25,9 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
 )
+from vllm.model_executor.layers.fused_moe.expert_sample import (
+    maybe_apply_expert_sample,
+)
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
@@ -865,6 +868,8 @@ class MoERunner(MoERunnerInterface):
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:
                 router_logits, _ = self.gate(hidden_states)
+
+        router_logits = maybe_apply_expert_sample(router_logits, self.router.top_k)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
